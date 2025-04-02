@@ -1,5 +1,6 @@
 use crate::id::Id;
-use crate::storage::Storage;
+use crate::storage::{Storage, Value};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 
@@ -14,29 +15,54 @@ fn get_bucket_index(distance: &[u8]) -> usize {
 }
 
 pub struct Node {
-    routing_table : RoutingTable,
+    routing_table: RoutingTable,
     storage: Storage,
 }
-
 
 impl Node {
     pub fn new(state: NodeState, replication_size: usize, max_routing_table_size: usize) -> Self {
         Self {
             routing_table: RoutingTable::new(state, replication_size, max_routing_table_size),
-            storage: Storage {},
+            storage: Storage::default(),
         }
+    }
+
+    /// when receving a message from a node, we should try to update
+    /// its contact in our list.
+    pub fn new_contact(&mut self, node: NodeState) {
+        self.routing_table.update(node);
     }
 
     /// either returns the value of the key, or the node which may know about it.
     /// caller should make sure to not keep asking nodes forever in an infinite loop
-    pub fn find_value(&self, id: &Id) -> either::Either<Vec<u8>, NodeState> {
-        // check if we have seen that Id,
-        // if not, return the closest node which may have it.
-        todo!()
+    pub fn find_value(&self, id: &Id, max_nodes: usize) -> either::Either<Value, Vec<NodeState>> {
+        if let Some(value) = self.storage.get(id) {
+            return either::Either::Left(value);
+        }
+
+        either::Either::Right(self.routing_table.find_closest_nodes(id, max_nodes))
+    }
+
+    /// used both for FIND_NODE RPC call, but also to store data into the network.
+    /// The server must find the closest nodes of the id and request them to save
+    /// the value.
+    pub fn find_node(&self, id: &Id, max_nodes: usize) -> Vec<NodeState> {
+        self.routing_table.find_closest_nodes(id, max_nodes)
+    }
+
+    /// store locally the value
+    pub fn store(&mut self, id: Id, value: Vec<u8>) {
+        self.storage.put(id, value);
+    }
+
+    /// perform any maintenance task needed, this should be called in a loop with sleep
+    pub fn tick(&mut self, expiration_minutes_storage: i64) {
+        // for now we only need to clean the storage
+        self.storage.clean(expiration_minutes_storage);
     }
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeState {
     pub id: Id,
     pub address: SocketAddr,
@@ -89,6 +115,10 @@ impl KBucket {
             size: self.size,
         }
     }
+
+    pub fn nodes(&self) -> VecDeque<NodeState> {
+        self.nodes.clone()
+    }
 }
 
 pub struct RoutingTable {
@@ -139,15 +169,27 @@ impl RoutingTable {
         }
     }
 
-    // to be used in the FIND_NODE and FIND_VALUE RPC call
     pub fn find_closest_node(&self, id: &Id) -> Option<NodeState> {
         let distance = get_bucket_index(&self.state.id.distance(id));
-        let mut bucket_index = std::cmp::min(distance, self.buckets.len() - 1);
-        let closest = self.buckets[bucket_index].nodes.iter().min_by_key(|i| i.id.distance(id));
+        let bucket_index = std::cmp::min(distance, self.buckets.len() - 1);
+        let closest = self.buckets[bucket_index]
+            .nodes
+            .iter()
+            .min_by_key(|i| i.id.distance(id));
         closest.cloned()
     }
 
-    //TODO find closest_nodes for nodes lookups and STORE RPC call
+    pub fn find_closest_nodes(&self, id: &Id, max: usize) -> Vec<NodeState> {
+        let distance = get_bucket_index(&self.state.id.distance(id));
+        let bucket_index = std::cmp::min(distance, self.buckets.len() - 1);
+
+        let result = self.buckets[bucket_index].nodes();
+        let mut result: Vec<NodeState> = result.into_iter().collect();
+
+        let max = std::cmp::min(max, result.len());
+        result.sort_by_key(|i| i.id.distance(id));
+        result[0..max].to_vec()
+    }
 }
 
 #[cfg(test)]
@@ -239,7 +281,6 @@ mod tests {
         assert_eq!(kbucket.nodes[1].id, id2);
     }
 
-
     #[test]
     fn test_routing_table_update() {
         let local_id = Id([0; 20]);
@@ -252,7 +293,7 @@ mod tests {
         let mut routing_table = RoutingTable::new(local_state.clone(), 16, 10);
 
         let new_node = NodeState {
-            id: Id([1; 20]), 
+            id: Id([1; 20]),
             address: "127.0.0.2:8080".parse().unwrap(),
         };
 
@@ -268,7 +309,10 @@ mod tests {
         routing_table.update(updated_node.clone());
 
         assert!(routing_table.buckets[0].contains(&updated_node.id));
-        assert_eq!(routing_table.buckets[0].nodes.front().unwrap().address, updated_node.address);
+        assert_eq!(
+            routing_table.buckets[0].nodes.front().unwrap().address,
+            updated_node.address
+        );
 
         for i in 2..17 {
             let node = NodeState {

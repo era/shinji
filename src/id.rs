@@ -1,4 +1,6 @@
-#[derive(PartialEq, Debug, Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Serialize, Deserialize)]
 pub struct Id(pub [u8; 20]);
 
 impl Id {
