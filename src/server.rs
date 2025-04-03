@@ -1,12 +1,12 @@
 use crate::id::Id;
 use crate::node::{Node, NodeState};
-use crate::storage::Value;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::RwLock;
+use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
 use warp::Filter;
 
@@ -41,10 +41,10 @@ pub struct Server {
 
 impl Server {
     pub fn new(public_ip: SocketAddr, port: u32) -> Self {
-        // using sha1 just because this is a learning library
+        // using sha1 just because this is a library done only for learning about DHT
         // and sha1 generates hashes with the right size of the key
         // in the original paper
-        // this should not be used in any security critical capacity.
+        // this should not be used in a real system due to the risk of collisions.
         let mut hasher = Sha1::new();
         let bytes = public_ip.to_string();
         let bytes = bytes.as_bytes();
@@ -124,15 +124,15 @@ impl Server {
     }
 
     /// get Value from the network (looks at local storage first)
-    pub async fn get(&self, id: &Id) -> Option<Value> {
+    pub async fn get(&self, id: Id) -> Option<Vec<u8>> {
         let node = self.node.read().unwrap();
-        match node.find_value(id, 5) {
-            either::Either::Left(value) => Some(value),
+        match node.find_value(&id, 5) {
+            either::Either::Left(value) => Some(value.data),
             either::Either::Right(servers) => {
                 // drop lock, since we don't need to hold it
                 // while fetching data from other servers
                 drop(node);
-                try_finding_value(servers, id).await
+                try_finding_value(self.state.clone(), servers, id).await
             }
         }
     }
@@ -163,6 +163,37 @@ async fn publish(sender: NodeState, servers: Vec<NodeState>, id: Id, data: Vec<u
     todo!()
 }
 
-async fn try_finding_value(servers: Vec<NodeState>, id: &Id) -> Option<Value> {
-    todo!()
+/// we could use the response from the servers to keep looking into the value through
+/// the whole network. But for simplicity we just look at the servers that were supplied
+/// from our own local state.
+async fn try_finding_value(sender: NodeState, servers: Vec<NodeState>, id: Id) -> Option<Vec<u8>> {
+    let mut set = JoinSet::new();
+    let request = RequestFind { sender, id };
+    for server in servers {
+        let request = request.clone();
+        set.spawn(async move {
+            let client = reqwest::Client::new();
+            client
+                .post(format!("http://{}/find_value", server.address))
+                .json(&request)
+                .send()
+                .await
+        });
+    }
+    while let Some(res) = set.join_next().await {
+        match res.ok() {
+            // in theory it would be better to use the latest seen value
+            // for simplicity we don't care
+            Some(Ok(res)) if res.status().is_success() => {
+                if let Some::<ResponseFind>(response) = res.json().await.ok() {
+                    match response {
+                        ResponseFind::Value(data, _seen) => return Some(data),
+                        _ => tracing::debug!("data was not in the server"),
+                    }
+                }
+            }
+            _ => tracing::debug!("ignoring any other response that is not the value itself"),
+        };
+    }
+    None
 }
