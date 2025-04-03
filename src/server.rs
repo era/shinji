@@ -1,7 +1,6 @@
 use crate::id::Id;
 use crate::node::{Node, NodeState};
 use crate::storage::Value;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::error::Error;
@@ -18,8 +17,25 @@ pub struct RequestStore {
     pub id: Id,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RequestFind {
+    pub sender: NodeState,
+    pub id: Id,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum ResponseFind {
+    Servers(Vec<NodeState>),
+    Value(Vec<u8>, i64),
+}
+
 pub struct Server {
+    // all requests are serialized, if this was a production code
+    // we should move the lock to inside the node and the storage
+    // and try to shard the locks, so that multiple non-related
+    // requests can go through
     node: Arc<RwLock<Node>>,
+    state: NodeState,
     port: u32,
 }
 
@@ -40,36 +56,71 @@ impl Server {
             address: public_ip,
         };
 
-        let node = Node::new(state, 16, 10);
+        let node = Node::new(state.clone(), 16, 10);
         let node = Arc::new(RwLock::new(node));
 
-        Self { node, port }
+        Self { node, port, state }
     }
 
+    ///  spawn two tasks:
+    ///  1. a thread to keep cleaning old values stored in-memory
+    ///  2. the webserver
     pub fn spawn_tasks(&self) -> Result<(), Box<dyn Error>> {
         let tick = self.node.clone();
         tokio::task::spawn(async move {
             loop {
-                //TODO handle graceful shutdown
                 // cleans all data older than 5 minutes
                 tick.write().unwrap().tick(5);
                 sleep(Duration::from_secs(60)).await;
             }
         });
 
-        let node_warp = warp::any().map(move || self.node.clone());
+        let node = self.node.clone();
+        let port = self.port;
+        let address: core::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
 
-        let store_value = warp::path!("store")
-            .and(warp::body::json())
-            .and(node_warp.clone())
-            .map(|value: RequestStore, node: Arc<RwLock<Node>>| {
-                //TODO update contacts
-                node.write().unwrap().store(value.id, value.data);
-                warp::reply::with_status("{}", warp::http::StatusCode::CREATED)
-            });
+        tokio::task::spawn(async move {
+            let node_warp = warp::any().map(move || node.clone());
 
-        // spawn server
-        todo!()
+            let store_value = warp::path!("store")
+                .and(warp::body::json())
+                .and(node_warp.clone())
+                .map(|value: RequestStore, node: Arc<RwLock<Node>>| {
+                    let mut node = node.write().unwrap();
+                    node.new_contact(value.sender);
+                    node.store(value.id, value.data);
+                    warp::reply::with_status("{}", warp::http::StatusCode::CREATED)
+                });
+            let find_value = warp::path!("find_value")
+                .and(warp::body::json())
+                .and(node_warp.clone())
+                .map(|value: RequestFind, node: Arc<RwLock<Node>>| {
+                    let mut node = node.write().unwrap();
+                    node.new_contact(value.sender);
+
+                    let response = node.find_value(&value.id, 10);
+                    let response = match response {
+                        either::Either::Right(s) => ResponseFind::Servers(s),
+                        either::Either::Left(v) => ResponseFind::Value(v.data, v.timestamp),
+                    };
+                    warp::reply::json(&response)
+                });
+            let find_node = warp::path!("find_node")
+                .and(warp::body::json())
+                .and(node_warp.clone())
+                .map(|value: RequestFind, node: Arc<RwLock<Node>>| {
+                    let mut node = node.write().unwrap();
+                    node.new_contact(value.sender);
+
+                    let response = ResponseFind::Servers(node.find_node(&value.id, 10));
+                    warp::reply::json(&response)
+                });
+
+            let routes = store_value.or(find_value).or(find_node);
+            warp::serve(routes).run(address).await;
+        });
+
+        Ok(())
     }
 
     /// get Value from the network (looks at local storage first)
@@ -91,11 +142,24 @@ impl Server {
         let node = self.node.read().unwrap();
         let servers = node.find_node(&id, 5);
         drop(node);
-        publish(servers, id, value).await;
+        publish(self.state.clone(), servers, id, value).await;
     }
 }
 
-async fn publish(servers: Vec<NodeState>, id: Id, value: Vec<u8>) {
+async fn publish(sender: NodeState, servers: Vec<NodeState>, id: Id, data: Vec<u8>) {
+    let request = RequestStore { id, sender, data };
+    for server in servers {
+        let request = request.clone();
+        tokio::task::spawn(async move {
+            let client = reqwest::Client::new();
+            let res = client
+                .post(format!("http://{}/store", server.address))
+                .json(&request)
+                .send()
+                .await;
+            tracing::info!(for_server = %server.address, result = ?res, "publish value");
+        });
+    }
     todo!()
 }
 

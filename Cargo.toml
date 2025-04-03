@@ -5,9 +5,11 @@ edition = "2021"
 
 [dependencies]
 either = "1.15.0"
+reqwest = { version = "0.12.15", features = ["json"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha1 = "0.10.6"
 time = "0.3"
 tokio = { version = "1.44.1", features = ["full"] }
+tracing = "0.1.41"
 warp = "0.3.7"
