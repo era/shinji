@@ -1,7 +1,6 @@
 use crate::id::Id;
 use crate::node::{Node, NodeState};
 use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,13 +27,29 @@ pub enum ResponseFind {
     Servers(Vec<NodeState>),
     Value(Vec<u8>, i64),
 }
-
+/// The main data struct of the library, in order to create a new node
+/// on the network you must call `new`.
+///
+/// ```rust
+/// // you should use a public ip instead of local host in real world
+/// // the second argument is the port the server should listen to
+/// use shinji::Server;
+/// let node = Server::new("127.0.0.1:8080".parse().unwrap(), 8080);
+/// // spawn all tasks needed such as the server and the storage
+/// // maintenance
+/// // node.spawn_tasks(); // you need tokio runtime setup to call this
+/// // in order to publish a new value to the network you should call
+/// // publish
+/// // and to get a value from the network you should call
+/// // get
+/// ```
 pub struct Server {
     // all requests are serialized, if this was a production code
     // we should move the lock to inside the node and the storage
     // and try to shard the locks, so that multiple non-related
     // requests can go through
     node: Arc<RwLock<Node>>,
+
     state: NodeState,
     port: u32,
 }
@@ -45,21 +60,20 @@ impl Server {
         // and sha1 generates hashes with the right size of the key
         // in the original paper
         // this should not be used in a real system due to the risk of collisions.
-        let mut hasher = Sha1::new();
-        let bytes = public_ip.to_string();
-        let bytes = bytes.as_bytes();
-        hasher.update(bytes);
 
-        let id = Id(hasher.finalize().into());
-        let state = NodeState {
-            id,
-            address: public_ip,
-        };
+        let state = NodeState::new(public_ip);
 
         let node = Node::new(state.clone(), 16, 10);
         let node = Arc::new(RwLock::new(node));
 
         Self { node, port, state }
+    }
+
+    pub fn initial_contacts(&self, contacts: Vec<NodeState>) {
+        let mut node = self.node.write().unwrap();
+        for contact in contacts {
+            node.new_contact(contact);
+        }
     }
 
     ///  spawn two tasks:
@@ -124,6 +138,9 @@ impl Server {
     }
 
     /// get Value from the network (looks at local storage first)
+    // the allow for await_holding_lock due to
+    // https://github.com/rust-lang/rust-clippy/issues/6446
+    #[allow(clippy::await_holding_lock)]
     pub async fn get(&self, id: Id) -> Option<Vec<u8>> {
         let node = self.node.read().unwrap();
         match node.find_value(&id, 5) {
@@ -138,6 +155,9 @@ impl Server {
     }
 
     /// publish a new (Id, Value) in the network
+    // the allow for await_holding_lock due to
+    // https://github.com/rust-lang/rust-clippy/issues/6446
+    #[allow(clippy::await_holding_lock)]
     pub async fn publish(&self, id: Id, value: Vec<u8>) {
         let node = self.node.read().unwrap();
         let servers = node.find_node(&id, 5);
@@ -160,7 +180,6 @@ async fn publish(sender: NodeState, servers: Vec<NodeState>, id: Id, data: Vec<u
             tracing::info!(for_server = %server.address, result = ?res, "publish value");
         });
     }
-    todo!()
 }
 
 /// we could use the response from the servers to keep looking into the value through
@@ -185,9 +204,10 @@ async fn try_finding_value(sender: NodeState, servers: Vec<NodeState>, id: Id) -
             // in theory it would be better to use the latest seen value
             // for simplicity we don't care
             Some(Ok(res)) if res.status().is_success() => {
-                if let Some::<ResponseFind>(response) = res.json().await.ok() {
+                if let Ok(response) = res.json().await {
                     match response {
                         ResponseFind::Value(data, _seen) => return Some(data),
+
                         _ => tracing::debug!("data was not in the server"),
                     }
                 }

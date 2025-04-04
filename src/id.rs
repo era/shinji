@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 
 #[derive(PartialEq, Eq, Hash, Debug, Clone, Serialize, Deserialize)]
 pub struct Id(pub [u8; 20]);
@@ -14,6 +15,12 @@ impl Id {
 
     pub fn as_bytes(&self) -> &[u8; 20] {
         &self.0
+    }
+
+    pub fn from(data: &str) -> Self {
+        let mut hasher = Sha1::new();
+        hasher.update(data.as_bytes());
+        Self(hasher.finalize().into())
     }
 }
 

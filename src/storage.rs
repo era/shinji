@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 use time::{Duration, OffsetDateTime};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Value {
     pub data: Vec<u8>,
     seen: Instant,
@@ -42,7 +42,7 @@ impl Storage {
             }
         }
 
-        self.seen.entry(now).or_insert_with(HashSet::new).insert(id);
+        self.seen.entry(now).or_default().insert(id);
     }
     pub fn get(&self, id: &Id) -> Option<Value> {
         self.data.get(id).cloned()

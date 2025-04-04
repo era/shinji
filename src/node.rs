@@ -68,6 +68,13 @@ pub struct NodeState {
     pub address: SocketAddr,
 }
 
+impl NodeState {
+    pub fn new(address: SocketAddr) -> Self {
+        let id = Id::from(&address.to_string());
+        Self { id, address }
+    }
+}
+
 pub struct KBucket {
     nodes: VecDeque<NodeState>,
     size: usize,
@@ -167,16 +174,6 @@ impl RoutingTable {
 
             bucket_index = std::cmp::min(distance, self.buckets.len() - 1);
         }
-    }
-
-    pub fn find_closest_node(&self, id: &Id) -> Option<NodeState> {
-        let distance = get_bucket_index(&self.state.id.distance(id));
-        let bucket_index = std::cmp::min(distance, self.buckets.len() - 1);
-        let closest = self.buckets[bucket_index]
-            .nodes
-            .iter()
-            .min_by_key(|i| i.id.distance(id));
-        closest.cloned()
     }
 
     pub fn find_closest_nodes(&self, id: &Id, max: usize) -> Vec<NodeState> {
